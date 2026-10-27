@@ -1,7 +1,7 @@
 # Lab2: BombLab 实验报告
 
-| 项目        | 内容                                         |
-| ----------- | -------------------------------------------- |
+| 项目        | 内容                                        |
+| ----------- | ------------------------------------------- |
 | GitHub 仓库 | https://github.com/LeoSian/ics-2026-bomblab |
 
 ---
@@ -38,7 +38,7 @@ make clean && make && make test | tail -12
 { ./defuser --seed 20251027; ./defuser --secret --seed 20251027; } | ./bomb --seed 20251027 | grep -E "challenge|defused"
 ```
 
-炸弹在终端里会输出两百多行剧情，用 `grep` 只留下每关的 challenge 和结果。
+输出接到管道时炸弹不打印剧情，`grep` 去掉的是每关的 `Input` 提示行，只留下 challenge 和结果。
 
 ![seed 20251027](images/seed_20251027.png)
 
@@ -80,31 +80,32 @@ sete %al                # 相等返回 1，main 收到 0 就引爆
 ```
 
 各关的不同之处：
+
 - 第 2 关把 challenge 存在 `r13`、口令字符串存在 `r12`；第 0 个数在循环前比较，第 1–5 个数在循环里比较，都用 `cmp` 加 `jne`，没有 `sete`。
 - 格式串地址：第 1、4、6 关是 `0x403189`（`"%u"`），第 3、5 关是 `0x403186`（`"%u %u"`），第 2 关是 `0x40317a`（6 个 `%u`）。
 - 输入存放的栈位置和比较的写法，各关见下面各节。
 
-`objdump` 不显示 `call 4011e0` 的函数名，在 GDB 里 `x/3i 0x4011e0` 能看到它跳到 `__isoc99_sscanf@got.plt`。格式串用 `x/s 地址` 查看。
+`objdump` 不显示 `call 4011e0` 的函数名。0x4011e0 是 PLT 桩，在 GDB 里 `x/3i 0x4011e0` 能看到 `jmp *0x6e66(%rip)`，即从 GOT 表项 `__isoc99_sscanf@got.plt` 取出地址再跳过去，所以它调用的是 `sscanf`；Honor 里的 `call 401190` 同理是 `strlen`。格式串用 `x/s 地址` 查看。
 
 所以每关先从 `valid_u32_fields` 的参数和格式串确定口令有几个数，再从最后的比较倒推期望值是怎么由 challenge（下文记作 `c`）算出来的。`c` 是 64 位的，各关先对它做 64 位右移，再取低 32 位，之后的运算都是 32 位、按模 2³² 回绕，所以 C 代码里先移位、再转成 `uint32_t` 计算。
 
 各关反复出现的关键指令：
 
-| 指令 | 含义 | 出现在 |
-| ---- | ---- | ------ |
-| `lea (%rdi,%rdi,2),%eax`、`lea 0x6fcd(%rdi,%rdi,4),%eax` | 只做地址形式的算术，不访问内存：`3*rdi`、`5*rdi + 0x6fcd` | 各关 |
-| `shr $n,%rax`、`and $mask,%eax`、`movzbl %al,%eax` | 逻辑右移；取低若干位；取低 8 位 | 各关从 `c` 中取位段 |
-| `mov %edi,%esi` 等写 32 位寄存器的指令 | 只取低 32 位，并把 64 位寄存器的高 32 位清零 | 各关 |
-| `cmp` 加 `sete %al` / `jne` | 比较；相等时返回值 `al` 为 1 / 不相等就跳到失败 | 各关的检查 |
-| `ja`、`jb`、`jbe` | 无符号比较后的跳转 | 第 3 关（下标越界）、第 4 关（往左或往右）、Honor（长度检查） |
-| `mov -0x40(%rbp,%rdx,4),%esi` | 基址 + 下标 × 4，即数组元素 `a[rdx]` | 第 2 关 |
-| `jmp *0x405820(,%rax,8)` | 从表里取出地址再跳过去（跳转表） | 第 3 关 |
-| `push %rbx` … `mov -0x8(%rbp),%rbx` | 被调用者保管寄存器的保存和恢复，递归时每层各有一份 | 第 4 关 |
-| `mov (%rdx),%rdx`、`mov 0x8(%rdx),%esi` | 按偏移读结构体字段，沿 `next` 指针走链表 | 第 5 关 |
-| `call *0x405e00(,%rax,8)` | 从表里取出函数地址再调用（函数指针） | 第 6 关 |
-| `rol $0x3,%eax`、`ror $0x2,%eax` | 循环左移、循环右移 | 第 6 关 |
-| `rep stos` | 把一段内存清零，相当于 `memset` | Honor |
-| `cmpl $0x4e45504f,-0xb0(%rbp)` | 比较 4 个字节，按小端序就是字符串 `"OPEN"` | Honor |
+| 指令                                                     | 含义                                                      | 出现在                                                        |
+| -------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------- |
+| `lea (%rdi,%rdi,2),%eax`、`lea 0x6fcd(%rdi,%rdi,4),%eax` | 只做地址形式的算术，不访问内存：`3*rdi`、`5*rdi + 0x6fcd` | 各关                                                          |
+| `shr $n,%rax`、`and $mask,%eax`、`movzbl %al,%eax`       | 逻辑右移；取低若干位；取低 8 位                           | 各关从 `c` 中取位段                                           |
+| `mov %edi,%esi` 等写 32 位寄存器的指令                   | 只取低 32 位，并把 64 位寄存器的高 32 位清零              | 各关                                                          |
+| `cmp` 加 `sete %al` / `jne`                              | 比较；相等时返回值 `al` 为 1 / 不相等就跳到失败           | 各关的检查                                                    |
+| `ja`、`jb`、`jbe`                                        | 无符号比较后的跳转                                        | 第 3 关（下标越界）、第 4 关（往左或往右）、Honor（长度检查） |
+| `mov -0x40(%rbp,%rdx,4),%esi`                            | 基址 + 下标 × 4，即数组元素 `a[rdx]`                      | 第 2 关                                                       |
+| `jmp *0x405820(,%rax,8)`                                 | 从表里取出地址再跳过去（跳转表）                          | 第 3 关                                                       |
+| `push %rbx` … `mov -0x8(%rbp),%rbx`                      | 被调用者保管寄存器的保存和恢复，递归时每层各有一份        | 第 4 关；第 6 关用 `rbx` 在第一次间接调用期间保住 `c & 0x38` |
+| `mov (%rdx),%rdx`、`mov 0x8(%rdx),%esi`                  | 按偏移读结构体字段，沿 `next` 指针走链表                  | 第 5 关                                                       |
+| `call *0x405e00(,%rax,8)`                                | 从表里取出函数地址再调用（函数指针）                      | 第 6 关                                                       |
+| `rol $0x3,%eax`、`ror $0x2,%eax`                         | 循环左移、循环右移                                        | 第 6 关                                                       |
+| `rep stos`                                               | 把一段内存清零，相当于 `memset`                           | Honor                                                         |
+| `cmpl $0x4e45504f,-0xb0(%rbp)`                           | 比较 4 个字节，按小端序就是字符串 `"OPEN"`                | Honor                                                         |
 
 ### 2.1 第 1 关：函数调用
 
@@ -240,6 +241,7 @@ flowchart LR
 
 ```text
 p4_walk(target=edi, lo=esi, hi=edx, key=ecx):
+mov %edi,%eax                                              # eax = target，edi 下面用来放 mid
 mov %edx,%edi ; sub %esi,%edi ; shr %edi ; add %esi,%edi   # mid = lo + ((hi - lo) >> 1)
 cmp %eax,%edi ; je 402390                                  # mid == target：返回 (mid + 0x7f) ^ key
 lea (%rdi,%rcx,1),%ebx                                     # ebx = mid + key
@@ -251,7 +253,7 @@ cmp %edi,%eax ; jb 402370                                  # target < mid 往左
   lea (%rax,%rax,2),%eax ; xor %ebx,%eax ; xor $0x7,%eax
 ```
 
-这是在 0..127 里二分查找 target。找到时返回 `(mid + 0x7f) ^ key`；每往回返回一层，把下层结果乘 3、异或本层的 `mid + key`，往左走的层再异或 7，往右走的层再异或 0x1d。`ebx` 是被调用者保管的寄存器，每层在开头压栈、结尾恢复，所以每层用的都是自己的 `mid + key`；`key` 在 `ecx` 里，各层都不改它。
+这是在 0..127 里二分查找 target。找到时返回 `(mid + 0x7f) ^ key`；每往回返回一层，把下层结果乘 3、异或本层的 `mid + key`，往左走的层再异或 7，往右走的层再异或 0x1d。`ebx` 是被调用者保管的寄存器：没找到 target 的层在 `je` 之后 `push %rbx`，返回前用 `mov -0x8(%rbp),%rbx` 恢复（找到 target 的最底层直接返回，不用 `rbx`），所以每层用的都是自己的 `mid + key`；`key` 在 `ecx` 里，各层都不改它。
 
 控制流图：
 
@@ -316,7 +318,7 @@ flowchart LR
 
 ### 2.6 第 6 关：函数指针表
 
-口令 1 个数。
+口令 1 个数，等于 `p6_dispatch(c)` 的返回值。下面是 `p6_dispatch` 的汇编：
 
 ```text
 shr $0x6,%rdi ; shr $0x20,%rax ; xor %eax,%edi   # v = (uint32)(c >> 6) ^ (uint32)(c >> 32)
@@ -330,8 +332,8 @@ add $0x76a3,%eax                                 # 口令 = r + 0x76a3
 
 用 `x/8gx 0x405e00` 读出函数指针表：
 
-| 下标 | 0      | 1      | 2      | 3      | 4      | 5      | 6      | 7      |
-| ---- | ------ | ------ | ------ | ------ | ------ | ------ | ------ | ------ |
+| 下标 | 0       | 1       | 2       | 3       | 4       | 5       | 6       | 7       |
+| ---- | ------- | ------- | ------- | ------- | ------- | ------- | ------- | ------- |
 | 函数 | p6_op_1 | p6_op_0 | p6_op_5 | p6_op_5 | p6_op_0 | p6_op_4 | p6_op_3 | p6_op_2 |
 
 6 个函数：
@@ -368,8 +370,8 @@ flowchart LR
 
 ```text
 secret_gate:
-lea -0xd0(%rbp),%r12 ; rep stos ...       # 栈上 164 字节的结构体清零
-call strlen ; sub $0x24,%rax ; cmp $0x7f,%rax ; jbe   # 长度在 36 到 163 之间
+mov $0x14,%ecx ; ... ; rep stos %rax ; movl $0x0,(%rdi)   # 从 rbp-0xd0 起清零 0x14 × 8 + 4 = 164 字节
+call 401190 ; sub $0x24,%rax ; cmp $0x7f,%rax ; jbe   # 401190 是 strlen；长度在 36 到 163 之间
 call secret_copy                          # 把整行逐字节复制进结构体，不检查长度
 cmpl $0x4e45504f,-0xb0(%rbp)              # 结构体偏移 0x20 处必须是 0x4e45504f
 lea -0xac(%rbp),%rdi ; call secret_phase  # 偏移 0x24 起的字符串交给 secret_phase
@@ -377,10 +379,10 @@ lea -0xac(%rbp),%rdi ; call secret_phase  # 偏移 0x24 起的字符串交给 se
 
 栈上结构体（起点 `rbp-0xd0`）和第七行的对应关系：
 
-| 结构体偏移 | 0x00–0x1f | 0x20–0x23 | 0x24 起 |
-| ---------- | --------- | --------- | ------- |
-| 第七行的内容 | 32 个 `A` | `OPEN` | 一个空格和 3 个数 `a b d` |
-| 程序怎么检查 | 不检查 | `cmpl $0x4e45504f` | 交给 `secret_phase` |
+| 结构体偏移   | 0x00–0x1f | 0x20–0x23          | 0x24 起                   |
+| ------------ | --------- | ------------------ | ------------------------- |
+| 第七行的内容 | 32 个 `A` | `OPEN`             | 一个空格和 3 个数 `a b d` |
+| 程序怎么检查 | 不检查    | `cmpl $0x4e45504f` | 交给 `secret_phase`       |
 
 控制流图：
 
@@ -402,10 +404,11 @@ flowchart TD
 `secret_phase(s, challenge, context)` 要求 3 个数（`"%u %u %u"`）：
 
 ```text
-and $0x3,%ecx ; cmp %ecx,-0x2c(%rbp)                 # a = context & 3
-imul $0x5f8,%ecx,%r9d ; ... ; xor %r13d,%r9d         # mask = (a * 0x5f8) ^ (uint32)(context >> 16)
-xor %r12d,%esi                                       # c_fold = challenge 高 32 位 ^ 低 32 位
-xor %r13d,%r8d                                       # x_fold = context 高 32 位 ^ 低 32 位
+mov %r13d,%ecx ; and $0x3,%ecx ; cmp %ecx,-0x2c(%rbp) # a = context & 3（r12 = challenge，r13 = context）
+imul $0x5f8,%ecx,%r9d                                # r9d = a * 0x5f8
+mov %r12,%rsi ; shr $0x20,%rsi ; xor %r12d,%esi      # c_fold = challenge 高 32 位 ^ 低 32 位
+mov %r13,%r8 ; shr $0x20,%r8 ; xor %r13d,%r8d        # x_fold = context 高 32 位 ^ 低 32 位
+shr $0x10,%r13 ; xor %r13d,%r9d                      # 此后 r13 = context >> 16；mask = (a * 0x5f8) ^ (uint32)(context >> 16)
 mov %esi,%edi ; xor %r8d,%edi ; call secret_mix      # secret_mix(c_fold ^ x_fold)
 xor %r9d,%eax ; cmp %eax,-0x28(%rbp)                 # b = secret_mix(...) ^ mask
 shr $0x3,%esi ; lea 0xe3c8(%r8,%rcx,1),%edx ; add %esi,%edx
@@ -424,7 +427,7 @@ xor %edx,%eax ; cmp -0x24(%rbp),%eax                 # d = b ^ (x_fold + a + 0xe
 
 - 实验文档：https://ics-26fall-fdu.github.io/labs/lab2-bomb-lab/ ，主要用到“实验引导”里的寄存器约定和 GDB 用法
 - 模板仓库的 `README.md`、`tutor/README.md`，以及 `teaching/07_stack_copy.c`（Honor 的相邻字段覆盖）
-- 《深入理解计算机系统》第 3 版第 3 章，各关用到的知识点在：3.4 访问信息、3.5 算术和逻辑操作（`lea`、移位）、3.6 控制（条件跳转、switch 和跳转表）、3.7 过程（参数寄存器、栈帧、被调用者保管寄存器、递归）、3.8 数组分配和访问、3.9 异质的数据结构（结构体）、3.10 控制与数据的结合（指针、函数指针、GDB、缓冲区溢出）
+- 《深入理解计算机系统》第 3 版第 3 章。
 
 ### 3.2 辅助工具及用途
 
