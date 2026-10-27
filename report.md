@@ -56,7 +56,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOPEN 3 2324444652 1440031403
 
 六关都输出 `Phase N defused.`，最后输出 `Secret phase defused.`。下面各关的数值例子都取自这次运行：在 GDB 里停在每关的比较指令上，读出程序算出的期望值，和上面的口令逐个相同。
 
-另外用脚本做了更多测试（脚本不在仓库里）：每关用 `--phase N --challenge X` 测了 1141 个 challenge，包括低 7 位的全部 128 种取值、0 和 2⁶⁴−1 等 13 个边界值、1000 个随机值；Honor 测了 309 个随机 seed。全部通过。
+另外用脚本做了更多测试（脚本不在仓库里）：每关用 `--phase N --challenge X` 测了 1141 个 challenge，包括低 7 位的全部 128 种取值（各关选分支只用到 c 的低 7 位，这 128 个值覆盖了第 3、5、6 关的每个分支和第 4 关的每条查找路径）、0 和 2⁶⁴−1 等 13 个边界值、1000 个随机值；Honor 测了 309 个随机 seed。全部通过。
 
 ---
 
@@ -85,7 +85,7 @@ sete %al                # 相等返回 1，main 收到 0 就引爆
 - 格式串地址：第 1、4、6 关是 `0x403189`（`"%u"`），第 3、5 关是 `0x403186`（`"%u %u"`），第 2 关是 `0x40317a`（6 个 `%u`）。
 - 输入存放的栈位置和比较的写法，各关见下面各节。
 
-`objdump` 不显示 `call 4011e0` 的函数名。0x4011e0 是 PLT 桩，在 GDB 里 `x/3i 0x4011e0` 能看到 `jmp *0x6e66(%rip)`，即从 GOT 表项 `__isoc99_sscanf@got.plt` 取出地址再跳过去，所以它调用的是 `sscanf`；Honor 里的 `call 401190` 同理是 `strlen`。格式串用 `x/s 地址` 查看。
+`objdump` 把这条调用显示成 `call 4011e0 <_init+0x1e0>`，看不出函数名。`0x4011e0` 是 PLT 里的一小段跳板，在 GDB 里用 `x/3i 0x4011e0` 能看到它执行 `jmp *0x6e66(%rip)`，即取出 GOT 表项 `__isoc99_sscanf@got.plt` 里存的地址再跳过去，所以调用的是 `sscanf`。格式串用 `x/s 地址` 查看。
 
 所以每关先从 `valid_u32_fields` 的参数和格式串确定口令有几个数，再从最后的比较倒推期望值是怎么由 challenge（下文记作 `c`）算出来的。`c` 是 64 位的，各关先对它做 64 位右移，再取低 32 位，之后的运算都是 32 位、按模 2³² 回绕，所以 C 代码里先移位、再转成 `uint32_t` 计算。
 
@@ -122,7 +122,7 @@ mov %ecx,%esi ; mov %eax,%edi
 call p1_step1                                    # p1_step1(step0, step2)
 ```
 
-`p1_step2` 只改 `eax` 和 `esi`，所以 `rdx`、`r8d` 在第二次调用时还是调用前算好的值。三个小函数：
+`p1_step2` 只改 `eax` 和 `esi`，所以 `rdx`、`r8d` 在第二次调用时还是调用前算好的值。按调用约定，`rdx`、`r8` 是调用者保管寄存器，一般不能假定调用后不变；这里是编译器知道被调函数的实现才这样用。第 4 关的 `ecx`、Honor 的 `esi` 也是这样。三个小函数：
 
 - `p1_step2(a, b)`：`lea (%rdi,%rdi,2)` 得 `3a`，再和 `b + 0xf7d1` 异或
 - `p1_step0(a, b)`：`(b ^ 0x5c70) + 4a`，`xor` 是 32 位运算，只用到 `c>>16` 的低 32 位
@@ -200,7 +200,7 @@ flowchart TD
 ```text
 p3_dispatch:
 mov %edi,%eax ; mov %esi,%edi       # eax = 下标，edi = v
-cmp $0x7,%eax ; ja 4022a5           # 下标 > 7 返回 0（default）
+cmp $0x7,%eax ; ja 4022a5           # 下标 > 7 返回 0（default）；本关下标是 c & 7，走不到
 notrack jmp *0x405820(,%rax,8)      # 按跳转表跳转
 ```
 
@@ -223,10 +223,12 @@ notrack jmp *0x405820(,%rax,8)      # 按跳转表跳转
 
 ```mermaid
 flowchart LR
-    C["challenge c"] --> X["下标 = c & 7，也是第一个数"]
+    C["challenge c"] --> X["下标 = c & 7"]
     C --> V["v = (c 右移 32) ^ (c 右移 3)，取低 32 位"]
-    X --> J{"下标大于 7 ？"}
-    J -- 是 --> D["default：返回 0"]
+    X --> F{"第一个数等于下标？"}
+    F -- 否 --> B["返回 0，爆炸"]
+    F -- 是 --> J{"下标大于 7 ？"}
+    J -- 是 --> D["default：返回 0（本关走不到）"]
     J -- 否 --> T["jmp *0x405820(,下标,8)"]
     T --> K["p3_case_N(v)，对应关系见上表"]
     V --> K
@@ -243,17 +245,22 @@ flowchart LR
 p4_walk(target=edi, lo=esi, hi=edx, key=ecx):
 mov %edi,%eax                                              # eax = target，edi 下面用来放 mid
 mov %edx,%edi ; sub %esi,%edi ; shr %edi ; add %esi,%edi   # mid = lo + ((hi - lo) >> 1)
-cmp %eax,%edi ; je 402390                                  # mid == target：返回 (mid + 0x7f) ^ key
+cmp %eax,%edi ; je 402390                                  # mid == target：跳到 402390
+push %rbp ; mov %rsp,%rbp ; push %rbx                      # 要继续递归，才建栈帧、保存调用者的 rbx
 lea (%rdi,%rcx,1),%ebx                                     # ebx = mid + key
-cmp %edi,%eax ; jb 402370                                  # target < mid 往左
-  lea 0x1(%rdi),%esi ; call p4_walk                        # 往右：p4_walk(target, mid+1, hi, key)
-  lea (%rax,%rax,2),%eax ; xor %ebx,%eax ; xor $0x1d,%eax
+cmp %edi,%eax ; jb 402370                                  # target < mid（无符号）往左
+  lea 0x1(%rdi),%esi ; mov %eax,%edi ; call p4_walk        # 往右：r = p4_walk(target, mid+1, hi, key)
+  lea (%rax,%rax,2),%eax ; xor %ebx,%eax                   # 3r ^ (mid + key)
+  mov -0x8(%rbp),%rbx ; leave ; xor $0x1d,%eax ; ret       # 恢复 rbx，再异或 0x1d
 402370:
-  lea -0x1(%rdi),%edx ; call p4_walk                       # 往左：p4_walk(target, lo, mid-1, key)
-  lea (%rax,%rax,2),%eax ; xor %ebx,%eax ; xor $0x7,%eax
+  lea -0x1(%rdi),%edx ; mov %eax,%edi ; call p4_walk       # 往左：r = p4_walk(target, lo, mid-1, key)
+  lea (%rax,%rax,2),%eax ; xor %ebx,%eax
+  mov -0x8(%rbp),%rbx ; leave ; xor $0x7,%eax ; ret        # 恢复 rbx，再异或 0x7
+402390:
+  lea 0x7f(%rdi),%eax ; xor %ecx,%eax ; ret                # 找到：返回 (mid + 0x7f) ^ key
 ```
 
-这是在 0..127 里二分查找 target。找到时返回 `(mid + 0x7f) ^ key`；每往回返回一层，把下层结果乘 3、异或本层的 `mid + key`，往左走的层再异或 7，往右走的层再异或 0x1d。`ebx` 是被调用者保管的寄存器：没找到 target 的层在 `je` 之后 `push %rbx`，返回前用 `mov -0x8(%rbp),%rbx` 恢复（找到 target 的最底层直接返回，不用 `rbx`），所以每层用的都是自己的 `mid + key`；`key` 在 `ecx` 里，各层都不改它。
+这是在 0..127 里二分查找 target。找到时返回 `(mid + 0x7f) ^ key`；每往回返回一层，把下层结果乘 3、异或本层的 `mid + key`，往左走的层再异或 7，往右走的层再异或 0x1d。`ebx` 是被调用者保管的寄存器：没找到 target 的层在 `je` 之后 `push %rbx`，返回前用 `mov -0x8(%rbp),%rbx` 恢复，所以每层用的都是自己的 `mid + key`；找到 target 的最底层不用 `ebx`，也就不保存它。`key` 在 `ecx` 里，各层都不改它。
 
 控制流图：
 
@@ -276,14 +283,22 @@ flowchart TD
 口令 2 个数：第一个等于 `p5_traverse(c, &out)` 的返回值，第二个等于 `out`。
 
 ```text
-and $0x7,%eax ; mov 0x405b60(,%rax,8),%rdx     # node = p5_heads[c & 7]
-mov 0x8(%rdx),%esi                             # node 偏移 8：value
-lea (%rax,%rax,2),%eax ; add 0xc(%rdx),%eax    # acc = 3*acc + 偏移 0xc 的 weight
-mov %esi,(%r8) ; xor %esi,%eax                 # out = value；acc ^= value
-and $0x3,%edi ; je 返回                        # 步数 = (c >> 3) & 3
-循环：
-mov (%rdx),%rdx                                # node = 偏移 0 的 next
-（同样更新 acc 和 out）
+mov %rdi,%rax ; mov %rdi,%rcx ; mov %rsi,%r8                 # r8 = &out
+and $0x7,%eax ; shr $0x3,%rcx                                # rcx = c >> 3
+mov 0x405b60(,%rax,8),%rdx                                   # node = p5_heads[c & 7]
+mov %rdi,%rax ; shr $0x20,%rdi ; shr $0x6,%rax ; xor %edi,%eax
+mov 0x8(%rdx),%esi                                           # node 偏移 8：value
+mov %ecx,%edi                                                # edi = (c >> 3) 的低 32 位
+xor $0x488a,%eax                                             # acc 初值 = ((c >> 6) ^ (c >> 32)) ^ 0x488a（32 位）
+lea (%rax,%rax,2),%eax ; add 0xc(%rdx),%eax                  # acc = 3*acc + 偏移 0xc 的 weight
+mov %esi,(%r8) ; xor %esi,%eax                               # out = value；acc ^= value
+and $0x3,%edi ; je 402480                                    # 步数 = (c >> 3) & 3，为 0 直接返回
+mov $0x1,%ecx
+402468:
+mov (%rdx),%rdx                                              # node = 偏移 0 的 next
+lea (%rax,%rax,2),%eax ; add $0x1,%ecx
+mov 0x8(%rdx),%esi ; add 0xc(%rdx),%eax ; xor %esi,%eax ; mov %esi,(%r8)
+cmp %ecx,%edi ; jae 402468                                   # 步数 >= ecx 就继续，一共走“步数”次
 ```
 
 由三个偏移推出结点是 16 字节的结构体：
@@ -370,8 +385,8 @@ flowchart LR
 
 ```text
 secret_gate:
-mov $0x14,%ecx ; ... ; rep stos %rax ; movl $0x0,(%rdi)   # 从 rbp-0xd0 起清零 0x14 × 8 + 4 = 164 字节
-call 401190 ; sub $0x24,%rax ; cmp $0x7f,%rax ; jbe   # 401190 是 strlen；长度在 36 到 163 之间
+lea -0xd0(%rbp),%r12 ; rep stos ; movl $0x0,(%rdi)   # 栈上结构体清零：0x14 个 8 字节加 4 字节，共 164 字节
+call 401190 ; sub $0x24,%rax ; cmp $0x7f,%rax ; jbe   # 401190 是 strlen 的 PLT 跳板；长度在 36 到 163 之间
 call secret_copy                          # 把整行逐字节复制进结构体，不检查长度
 cmpl $0x4e45504f,-0xb0(%rbp)              # 结构体偏移 0x20 处必须是 0x4e45504f
 lea -0xac(%rbp),%rdi ; call secret_phase  # 偏移 0x24 起的字符串交给 secret_phase
@@ -404,16 +419,21 @@ flowchart TD
 `secret_phase(s, challenge, context)` 要求 3 个数（`"%u %u %u"`）：
 
 ```text
-mov %r13d,%ecx ; and $0x3,%ecx ; cmp %ecx,-0x2c(%rbp) # a = context & 3（r12 = challenge，r13 = context）
-imul $0x5f8,%ecx,%r9d                                # r9d = a * 0x5f8
-mov %r12,%rsi ; shr $0x20,%rsi ; xor %r12d,%esi      # c_fold = challenge 高 32 位 ^ 低 32 位
-mov %r13,%r8 ; shr $0x20,%r8 ; xor %r13d,%r8d        # x_fold = context 高 32 位 ^ 低 32 位
-shr $0x10,%r13 ; xor %r13d,%r9d                      # 此后 r13 = context >> 16；mask = (a * 0x5f8) ^ (uint32)(context >> 16)
-mov %esi,%edi ; xor %r8d,%edi ; call secret_mix      # secret_mix(c_fold ^ x_fold)
-xor %r9d,%eax ; cmp %eax,-0x28(%rbp)                 # b = secret_mix(...) ^ mask
+                                                        # r12 = challenge，r13 = context
+mov %r13d,%ecx ; and $0x3,%ecx ; cmp %ecx,-0x2c(%rbp)   # a = context & 3
+mov %r12,%rsi ; imul $0x5f8,%ecx,%r9d ; mov %r13,%r8     # r9d = a * 0x5f8
+shr $0x20,%rsi ; shr $0x20,%r8
+xor %r12d,%esi                                          # c_fold = challenge 高 32 位 ^ 低 32 位
+xor %r13d,%r8d                                          # x_fold = context 高 32 位 ^ 低 32 位
+shr $0x10,%r13                                          # 从这里起 r13 = context >> 16
+mov %esi,%edi ; xor %r13d,%r9d                          # mask = (a * 0x5f8) ^ (uint32)(context >> 16)
+xor %r8d,%edi ; call secret_mix                         # secret_mix(c_fold ^ x_fold)
+xor %r9d,%eax ; cmp %eax,-0x28(%rbp)                    # b = secret_mix(...) ^ mask
 shr $0x3,%esi ; lea 0xe3c8(%r8,%rcx,1),%edx ; add %esi,%edx
-xor %edx,%eax ; cmp -0x24(%rbp),%eax                 # d = b ^ (x_fold + a + 0xe3c8 + (c_fold >> 3))
+xor %edx,%eax ; cmp -0x24(%rbp),%eax                    # d = b ^ (x_fold + a + 0xe3c8 + (c_fold >> 3))
 ```
+
+`secret_mix` 只改 `eax` 和 `edi`，所以调用回来后 `esi`（c_fold）、`r8d`（x_fold）、`ecx`（a）还是调用前的值。
 
 其中 `secret_mix(m) = ((m >> 3) ^ 0xe3c8) + (m ^ 0x5f8)`。第七行写成 32 个 `A`，接 `OPEN`，再接 ` a b d`。`OPEN` 后面的空格不影响，`valid_u32_fields` 和 `%u` 都会跳过开头的空白。
 
