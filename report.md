@@ -122,7 +122,7 @@ mov %ecx,%esi ; mov %eax,%edi
 call p1_step1                                    # p1_step1(step0, step2)
 ```
 
-`p1_step2` 只改 `eax` 和 `esi`，所以 `rdx`、`r8d` 在第二次调用时还是调用前算好的值。按调用约定，`rdx`、`r8` 是调用者保管寄存器，一般不能假定调用后不变；这里是编译器知道被调函数的实现才这样用。第 4 关的 `ecx`、Honor 的 `esi` 也是这样。三个小函数：
+`p1_step2` 只改 `eax` 和 `esi`，所以 `rdx`、`r8d` 在第二次调用时还是调用前算好的值。按调用约定，`rdx`、`r8` 是调用者保管寄存器，一般不能假定调用后不变；这里是编译器知道被调函数的实现才这样用。上面代码块里 `ecx` 跨过 `call p1_step0` 保存 step2、Honor 里 `esi` 跨过 `call secret_mix`，也是这样。三个小函数：
 
 - `p1_step2(a, b)`：`lea (%rdi,%rdi,2)` 得 `3a`，再和 `b + 0xf7d1` 异或
 - `p1_step0(a, b)`：`(b ^ 0x5c70) + 4a`，`xor` 是 32 位运算，只用到 `c>>16` 的低 32 位
@@ -385,7 +385,8 @@ flowchart LR
 
 ```text
 secret_gate:
-lea -0xd0(%rbp),%r12 ; rep stos ; movl $0x0,(%rdi)   # 栈上结构体清零：0x14 个 8 字节加 4 字节，共 164 字节
+xor %eax,%eax ; mov $0x14,%ecx ; lea -0xd0(%rbp),%r12 ; mov %r12,%rdi
+rep stos %rax,%es:(%rdi) ; movl $0x0,(%rdi)          # 从 rbp-0xd0 起写 0x14 个 8 字节的 0，再写 4 字节 0，共 164 字节
 call 401190 ; sub $0x24,%rax ; cmp $0x7f,%rax ; jbe   # 401190 是 strlen 的 PLT 跳板；长度在 36 到 163 之间
 call secret_copy                          # 把整行逐字节复制进结构体，不检查长度
 cmpl $0x4e45504f,-0xb0(%rbp)              # 结构体偏移 0x20 处必须是 0x4e45504f
