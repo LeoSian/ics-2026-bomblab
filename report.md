@@ -1,0 +1,302 @@
+# Lab2: BombLab 实验报告
+
+| 项目        | 内容                                         |
+| ----------- | -------------------------------------------- |
+| GitHub 仓库 | https://github.com/LeoSian/ics-2026-bomblab |
+
+---
+
+## 一、环境与测试结果
+
+### 1.1 环境
+
+| 项      | 版本                                    |
+| ------- | --------------------------------------- |
+| 系统    | Windows 11 + WSL 2 / Ubuntu 22.04.5 LTS |
+| 架构    | x86_64                                  |
+| GCC     | 14.3.0                                  |
+| GDB     | 12.1                                    |
+| objdump | 2.38                                    |
+| Make    | 4.3                                     |
+| Python  | 3.12.13                                 |
+
+### 1.2 公开测试
+
+```bash
+make clean && make && make test | tail -12
+```
+
+![公开测试](images/public_test.png)
+
+六关公开测试 60/60，Honor 公开测试 10/10。
+
+### 1.3 公开列表以外的 seed
+
+公开 seed 是 `tests/public.json` 里的 10 个。另选 seed 20251027，一次跑完六关和 Honor：
+
+```bash
+{ ./defuser --seed 20251027; ./defuser --secret --seed 20251027; } | ./bomb --seed 20251027 | grep -E "challenge|defused"
+```
+
+炸弹在终端里会输出两百多行剧情，用 `grep` 只留下每关的 challenge 和结果。
+
+![seed 20251027](images/seed_20251027.png)
+
+这次生成的 7 行口令：
+
+```text
+3790663410
+750 2214 6627 19794 59349 178152
+7 4074669621
+2560395152
+1767913273 2883
+4054042131
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOPEN 3 2324444652 1440031403
+```
+
+六关都输出 `Phase N defused.`，最后输出 `Secret phase defused.`。下面各关的数值例子都取自这次运行：在 GDB 里停在每关的比较指令上，读出程序算出的期望值，和上面的口令逐个相同。
+
+另外用脚本做了更多测试（脚本不在仓库里）：每关用 `--phase N --challenge X` 测了 1141 个 challenge，包括低 7 位的全部 128 种取值、0 和 2⁶⁴−1 等 13 个边界值、1000 个随机值；Honor 测了 309 个随机 seed。全部通过。
+
+---
+
+## 二、各关分析
+
+### 2.0 共同结构
+
+六关的结构相似。以第 1 关为例：
+
+```text
+mov  %rsi,%r12          # challenge 存进 r12
+mov  $0x1,%esi
+mov  %rdi,%rbx          # 口令字符串存进 rbx
+call valid_u32_fields   # 检查口令是不是恰好 N 个无符号整数（N 在 esi）
+...
+mov  $0x403189,%esi     # 格式串
+call 4011e0             # sscanf
+...
+cmp  %eax,-0x14(%rbp)   # 算出的值和输入比较
+sete %al                # 相等返回 1，main 收到 0 就引爆
+```
+
+各关的不同之处：
+- 第 2 关把 challenge 存在 `r13`、口令字符串存在 `r12`；第 0 个数在循环前比较，第 1–5 个数在循环里比较，都用 `cmp` 加 `jne`，没有 `sete`。
+- 格式串地址：第 1、4、6 关是 `0x403189`（`"%u"`），第 3、5 关是 `0x403186`（`"%u %u"`），第 2 关是 `0x40317a`（6 个 `%u`）。
+- 输入存放的栈位置和比较的写法，各关见下面各节。
+
+`objdump` 不显示 `call 4011e0` 的函数名，在 GDB 里 `x/3i 0x4011e0` 能看到它跳到 `__isoc99_sscanf@got.plt`。格式串用 `x/s 地址` 查看。
+
+所以每关先从 `valid_u32_fields` 的参数和格式串确定口令有几个数，再从最后的比较倒推期望值是怎么由 challenge（下文记作 `c`）算出来的。`c` 是 64 位的，各关先对它做 64 位右移，再取低 32 位，之后的运算都是 32 位、按模 2³² 回绕，所以 C 代码里先移位、再转成 `uint32_t` 计算。
+
+### 2.1 第 1 关：函数调用
+
+口令 1 个数（`"%u"`）。期望值是 `p1_compute(c)` 的返回值：
+
+```text
+mov %rdi,%rax ; mov %rdi,%rdx ; mov %edi,%esi    # esi = c 的低 32 位
+shr $0x20,%rax ; mov %edi,%r8d ; shr $0x10,%rdx  # rax = c>>32，r8d = 低 32 位，rdx = c>>16
+mov %eax,%edi
+call p1_step2                                    # p1_step2(hi, lo)
+mov %rdx,%rsi ; mov %r8d,%edi ; mov %eax,%ecx
+call p1_step0                                    # p1_step0(lo, c>>16)
+mov %ecx,%esi ; mov %eax,%edi
+call p1_step1                                    # p1_step1(step0, step2)
+```
+
+`p1_step2` 只改 `eax` 和 `esi`，所以 `rdx`、`r8d` 在第二次调用时还是调用前算好的值。三个小函数：
+
+- `p1_step2(a, b)`：`lea (%rdi,%rdi,2)` 得 `3a`，再和 `b + 0xf7d1` 异或
+- `p1_step0(a, b)`：`(b ^ 0x5c70) + 4a`，`xor` 是 32 位运算，只用到 `c>>16` 的低 32 位
+- `p1_step1(a, b)`：`(3a + b) ^ 0x4147`
+
+计算关系：
+
+```text
+step2 = 3*hi ^ (lo + 0xf7d1)
+step0 = ((uint32)(c >> 16) ^ 0x5c70) + 4*lo
+口令  = (3*step0 + step2) ^ 0x4147
+```
+
+例子：c = `0x942a33f6e96a0404`，step2 = 1427398711，step0 = 3651061034，口令 3790663410。GDB 停在 `0x4020e0`（比较指令）时 `eax` 是 3790663410。
+
+### 2.2 第 2 关：数组和循环
+
+口令 6 个数。`sscanf` 的 6 个地址是 `-0x40` 到 `-0x2c`，每个差 4 字节（前 4 个放在 `rdx, rcx, r8, r9`，后 2 个用 `push` 压栈），是一个数组 `a[6]`。
+
+```text
+shr $0x17,%rax ; movzbl %al,%eax ; lea (%rax,%rax,2),%eax   # a[0] = 3 * ((c >> 23) & 0xff)
+cmp %eax,%esi
+                                                    # 循环，rdx = 1..5
+lea 0xc(%rdx),%ecx ; mov %r13,%rax ; shr %cl,%rax   # c >> (i + 12)
+and $0x3f,%eax ; add %edx,%eax ; xor %esi,%eax      # (... & 0x3f) + i，再异或上一个数
+mov -0x40(%rbp,%rdx,4),%esi                         # esi = a[i]，下一轮的“上一个数”
+lea (%rax,%rax,2),%eax ; cmp %eax,%esi              # a[i] 必须等于 3 倍
+add $0x1,%rdx ; cmp $0x6,%rdx ; jne
+```
+
+计算关系：
+
+```text
+a[0] = 3 * ((c >> 23) & 0xff)
+a[i] = 3 * ((((c >> (i + 12)) & 0x3f) + i) ^ a[i-1])，i = 1..5
+```
+
+例子：c = `0xb1944775fd517b7e`，`(c >> 23) & 0xff` = 250，a[0] = 750；i = 1 时 `(c >> 13) & 0x3f` = 11，`(11 + 1) ^ 750` = 738，a[1] = 2214；依次得到 6627、19794、59349、178152。GDB 在两处比较指令（`0x40216a`、`0x40218a`）看到的 6 个期望值相同。
+
+### 2.3 第 3 关：switch 和跳转表
+
+口令 2 个数。第一个数要等于 `c & 7`（`and $0x7,%edi; cmp %edi,-0x18(%rbp)`）。第二个数是 `p3_dispatch(c & 7, v)` 的返回值，其中 `v = (uint32)(c >> 32) ^ (uint32)(c >> 3)`。
+
+```text
+p3_dispatch:
+mov %edi,%eax ; mov %esi,%edi       # eax = 下标，edi = v
+cmp $0x7,%eax ; ja 4022a5           # 下标 > 7 返回 0（default）
+notrack jmp *0x405820(,%rax,8)      # 按跳转表跳转
+```
+
+用 `x/8gx 0x405820` 查看跳转表，表里每个地址处是一条 `jmp p3_case_N`。下标和分支的对应关系是打乱的：
+
+| 下标 | 分支      | 计算                      |
+| ---- | --------- | ------------------------- |
+| 0    | p3_case_3 | `(2v) ^ 0x90eb`           |
+| 1    | p3_case_2 | `5v + 0x2779a`            |
+| 2    | p3_case_6 | `(4v) ^ 0xc298`           |
+| 3    | p3_case_4 | `3v + 0xbe13`             |
+| 4    | p3_case_7 | `(v ^ 0x7122) + (v >> 2)` |
+| 5    | p3_case_5 | `5v + 0x3f25f`            |
+| 6    | p3_case_1 | `(v ^ 0x1785) + (v >> 2)` |
+| 7    | p3_case_0 | `5v + 0x6fcd`             |
+
+各分支多用 `lea`，例如 `lea 0x6fcd(%rdi,%rdi,4),%eax` 就是 `5v + 0x6fcd`。代码里用 `switch` 写。
+
+例子：c = `0x962b376535cf316f`，下标 7，v = 814928200，跳到 `p3_case_0`，第二个数 `5v + 0x6fcd` = 4074669621。GDB 停在 `0x40225d`（间接跳转）时看到下标 7、表项 `0x402270`。
+
+### 2.4 第 4 关：递归
+
+口令 1 个数，等于 `p4_walk(c & 0x7f, 0, 127, key)`，`key = (uint32)(c >> 7) ^ (uint32)(c >> 32)`。
+
+```text
+p4_walk(target=edi, lo=esi, hi=edx, key=ecx):
+mov %edx,%edi ; sub %esi,%edi ; shr %edi ; add %esi,%edi   # mid = lo + ((hi - lo) >> 1)
+cmp %eax,%edi ; je 402390                                  # mid == target：返回 (mid + 0x7f) ^ key
+lea (%rdi,%rcx,1),%ebx                                     # ebx = mid + key
+cmp %edi,%eax ; jb 402370                                  # target < mid 往左
+  lea 0x1(%rdi),%esi ; call p4_walk                        # 往右：p4_walk(target, mid+1, hi, key)
+  lea (%rax,%rax,2),%eax ; xor %ebx,%eax ; xor $0x1d,%eax
+402370:
+  lea -0x1(%rdi),%edx ; call p4_walk                       # 往左：p4_walk(target, lo, mid-1, key)
+  lea (%rax,%rax,2),%eax ; xor %ebx,%eax ; xor $0x7,%eax
+```
+
+这是在 0..127 里二分查找 target。找到时返回 `(mid + 0x7f) ^ key`；每往回返回一层，把下层结果乘 3、异或本层的 `mid + key`，往左走的层再异或 7，往右走的层再异或 0x1d。`ebx` 是被调用者保管的寄存器，每层在开头压栈、结尾恢复，所以每层用的都是自己的 `mid + key`；`key` 在 `ecx` 里，各层都不改它。
+
+例子：c = `0x66a297806ce71b4b`，target = 75，key = 1719359926。查找路径 63 → 95 → 79 → 71 → 75，最底层返回 1719359868，逐层返回 1426675092、2573687486、2857191976、2560395152。GDB 停在 `0x402390` 时用 `bt` 看到 5 层 `p4_walk`，返回地址依次对应右、左、左、右，和路径一致。
+
+### 2.5 第 5 关：结构体和链表
+
+口令 2 个数：第一个等于 `p5_traverse(c, &out)` 的返回值，第二个等于 `out`。
+
+```text
+and $0x7,%eax ; mov 0x405b60(,%rax,8),%rdx     # node = p5_heads[c & 7]
+mov 0x8(%rdx),%esi                             # node 偏移 8：value
+lea (%rax,%rax,2),%eax ; add 0xc(%rdx),%eax    # acc = 3*acc + 偏移 0xc 的 weight
+mov %esi,(%r8) ; xor %esi,%eax                 # out = value；acc ^= value
+and $0x3,%edi ; je 返回                        # 步数 = (c >> 3) & 3
+循环：
+mov (%rdx),%rdx                                # node = 偏移 0 的 next
+（同样更新 acc 和 out）
+```
+
+由三个偏移推出结点是 16 字节的结构体：
+
+```c
+struct p5_node { const struct p5_node *next; uint32_t value; uint32_t weight; };
+```
+
+用 `x/8gx 0x405b60` 读出 8 个表头，用 `x/24gx 0x405ba0` 读出 12 个结点（小端序，第二个 8 字节的低 4 字节是 value，高 4 字节是 weight），在 `defuser.c` 里照抄成静态数组。8 个起点往后走 3 步都不会遇到空指针。
+
+计算关系：
+
+```text
+node = p5_heads[c & 7]
+acc  = ((uint32)(c >> 6) ^ (uint32)(c >> 32)) ^ 0x488a
+acc  = (3*acc + node->weight) ^ node->value
+重复 (c >> 3) & 3 次：node = node->next；acc = (3*acc + node->weight) ^ node->value
+口令 = acc  node->value
+```
+
+例子：c = `0x614955b117da17f6`，起点 `p5_heads[6]` = `0x405c10`，走 2 步，经过 `0x405bb0` 到 `0x405bc0`（value 0xb43 = 2883），口令 `1767913273 2883`。GDB 在循环里看到的结点地址和两个期望值都相同。
+
+### 2.6 第 6 关：函数指针表
+
+口令 1 个数。
+
+```text
+shr $0x6,%rdi ; shr $0x20,%rax ; xor %eax,%edi   # v = (uint32)(c >> 6) ^ (uint32)(c >> 32)
+and $0x38,%ebx                                   # ebx = c & 0x38，即 8 * ((c >> 3) & 7)
+and $0x7,%eax
+call *0x405e00(,%rax,8)                          # r = p6_ops[c & 7](v)
+xor $0x2f31,%eax ; mov %eax,%edi
+call *0x405e00(%rbx)                             # r = p6_ops[(c >> 3) & 7](r ^ 0x2f31)
+add $0x76a3,%eax                                 # 口令 = r + 0x76a3
+```
+
+用 `x/8gx 0x405e00` 读出函数指针表：
+
+| 下标 | 0      | 1      | 2      | 3      | 4      | 5      | 6      | 7      |
+| ---- | ------ | ------ | ------ | ------ | ------ | ------ | ------ | ------ |
+| 函数 | p6_op_1 | p6_op_0 | p6_op_5 | p6_op_5 | p6_op_0 | p6_op_4 | p6_op_3 | p6_op_2 |
+
+6 个函数：
+
+- `p6_op_0`：`(v ^ 0x81a5) + 2v`
+- `p6_op_1`：`(32v + 0x8dc9) ^ 7v`（`shl $0x5`；`lea 0x0(,%rdi,8)` 减 v 得 7v）
+- `p6_op_2`：`(v + 0xc26) ^ (v >> 1)`
+- `p6_op_3`：循环左移 3 位（`rol`）后 `^ 0x5beb`
+- `p6_op_4`：循环右移 2 位（`ror`）
+- `p6_op_5`：`(v ^ (v >> 3)) + 0x3459`
+
+C 没有循环移位运算符，用 `(v << 3) | (v >> 29)` 这样的写法。代码里也建了一个同样顺序的函数指针数组。
+
+例子：c = `0x89330e4dbd1ebd05`，`c & 7` = 5 → `p6_op_4`，`(c >> 3) & 7` = 0 → `p6_op_1`；v = 3217519801，第一次调用得 1878121774，异或后 1878127135，第二次调用得 4054011760，加 0x76a3 得 4054042131。GDB 在两条 `call *` 处用 `info symbol` 确认目标是 `p6_op_4` 和 `p6_op_1`。
+
+### 2.7 Honor
+
+六关通过后，`main` 再读一行，调用 `secret_gate(这一行, challenge, context)`。`context` 由前六行口令算出（`transcript_context`），驱动已经算好传给 `solve_secret`。
+
+```text
+secret_gate:
+lea -0xd0(%rbp),%r12 ; rep stos ...       # 栈上 164 字节的结构体清零
+call strlen ; sub $0x24,%rax ; cmp $0x7f,%rax ; jbe   # 长度在 36 到 163 之间
+call secret_copy                          # 把整行逐字节复制进结构体，不检查长度
+cmpl $0x4e45504f,-0xb0(%rbp)              # 结构体偏移 0x20 处必须是 0x4e45504f
+lea -0xac(%rbp),%rdi ; call secret_phase  # 偏移 0x24 起的字符串交给 secret_phase
+```
+
+`0x4e45504f` 按小端序的字节是 `4f 50 45 4e`，即 `"OPEN"`。`secret_copy` 不管第一个字段多长，所以第七行的前 32 个字符填满第一个字段，第 33 到 36 个字符写进偏移 0x20 的字段，后面的部分在偏移 0x24。这和 `teaching/07_stack_copy.c` 里同一结构体内相邻字段被覆盖的情况相同，整行最长 163 个字符加结尾的 `\0`，不会超出这 164 字节，也不涉及返回地址。
+
+`secret_phase(s, challenge, context)` 要求 3 个数（`"%u %u %u"`）：
+
+```text
+and $0x3,%ecx ; cmp %ecx,-0x2c(%rbp)                 # a = context & 3
+imul $0x5f8,%ecx,%r9d ; ... ; xor %r13d,%r9d         # mask = (a * 0x5f8) ^ (uint32)(context >> 16)
+xor %r12d,%esi                                       # c_fold = challenge 高 32 位 ^ 低 32 位
+xor %r13d,%r8d                                       # x_fold = context 高 32 位 ^ 低 32 位
+mov %esi,%edi ; xor %r8d,%edi ; call secret_mix      # secret_mix(c_fold ^ x_fold)
+xor %r9d,%eax ; cmp %eax,-0x28(%rbp)                 # b = secret_mix(...) ^ mask
+shr $0x3,%esi ; lea 0xe3c8(%r8,%rcx,1),%edx ; add %esi,%edx
+xor %edx,%eax ; cmp -0x24(%rbp),%eax                 # d = b ^ (x_fold + a + 0xe3c8 + (c_fold >> 3))
+```
+
+其中 `secret_mix(m) = ((m >> 3) ^ 0xe3c8) + (m ^ 0x5f8)`。第七行写成 32 个 `A`，接 `OPEN`，再接 ` a b d`。`OPEN` 后面的空格不影响，`valid_u32_fields` 和 `%u` 都会跳过开头的空白。
+
+例子（seed 20251027）：Honor 的 challenge 是 `0xd9c9da0114a4df67`，context 是 `0x4222835387881183`，a = 3，b = 2324444652，d = 1440031403。GDB 停在 `0x40279b`（复制之后）时看到偏移 0x20 处是 `0x4e45504f`，三处比较的期望值和这三个数相同。
+
+---
+
+## 三、参考资料与 AI 使用说明
+
+- 实验文档和模板仓库的 README、`tutor/`、`teaching/07_stack_copy.c`
+- 《深入理解计算机系统》第 3 章（过程调用、数组、switch、数据结构）
+- GDB 文档：https://www.sourceware.org/gdb/documentation/
+- AI 使用说明：本次实验使用了 Claude Code（Claude Opus 5.5）。七关的反汇编分析、`defuser.c` 的实现、验证脚本和本报告的初稿由它完成，各关的数值例子来自它在 GDB 里的实际运行。
